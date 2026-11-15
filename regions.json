@@ -1,0 +1,16 @@
+{
+  "comment": "Region packs to build. bbox = [west, south, east, north] in degrees. Keep each pack around 150-300 km across: bigger packs take longer to download on the phone.",
+  "osm_area": "india",
+  "regions": [
+    {
+      "id": "maharashtra-west",
+      "name": "Maharashtra West (Kamshet, Panchgani, Sinhagad)",
+      "bbox": [72.80, 17.30, 74.90, 19.60]
+    },
+    {
+      "id": "bir-billing",
+      "name": "Himachal (Bir-Billing, Dharamshala, Manali)",
+      "bbox": [75.70, 31.30, 77.70, 32.80]
+    }
+  ]
+}
