@@ -242,6 +242,99 @@ def build_dem(region):
     return out
 
 
+# ---------------------------------------------------------------- contour lines
+
+CONTOUR_STEP = 20      # metres between lines; every 100 m is an index line (thicker, labelled)
+MERC = 20037508.342789244
+
+
+def build_contours(region):
+    """Contour lines from the region's terrain pack (z12, ~30 m), as vector tiles z10-14 in a
+    'contour' layer with 'height' and 'nth_line' - the same fields as MapTiler's contours, so the
+    app's map style draws them the same way, offline. Needs gdal_contour, ogr2ogr and tippecanoe
+    (the GitHub Action installs them; on a PC this step is skipped if they're missing)."""
+    if not all(shutil.which(t) for t in ("gdal_contour", "ogr2ogr", "tippecanoe")):
+        log(f"Contours {region['id']}: skipped (GDAL / tippecanoe not installed)")
+        return None
+    import numpy as np
+    from io import BytesIO
+    from PIL import Image
+    from pmtiles.reader import Reader, MmapSource
+
+    dem = OUT / f"{region['id']}-dem.pmtiles"
+    tmp = WORK / "contours" / region["id"]
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    tiles = tiles_in_bbox(region["bbox"], DEM_MAX_ZOOM)
+    xs = sorted({t[1] for t in tiles}); ys = sorted({t[2] for t in tiles})
+    z = DEM_MAX_ZOOM
+    tile_m = 2 * MERC / (1 << z)
+    px_m = tile_m / 256
+    B = 8   # tiles per block side (2048 x 2048 pixels)
+    sql = ("SELECT geom, CAST(height AS INTEGER) AS height, "
+           "CASE WHEN CAST(height AS INTEGER) % 100 = 0 THEN 10 WHEN CAST(height AS INTEGER) % 50 = 0 THEN 5 ELSE 1 END AS nth_line "
+           "FROM contour WHERE height > 0")
+
+    def block(bx, by):
+        bw = min(B, xs[-1] + 1 - bx); bh = min(B, ys[-1] + 1 - by)
+        with open(dem, "rb") as fh:
+            rd = Reader(MmapSource(fh))
+            # one extra tile right/below so lines join up across blocks
+            grid = np.full(((bh + 1) * 256, (bw + 1) * 256), np.nan, dtype=np.float32)
+            any_data = False
+            for j in range(bh + 1):
+                for i in range(bw + 1):
+                    data = rd.get(z, bx + i, by + j)
+                    if data is None:
+                        continue
+                    a = np.asarray(Image.open(BytesIO(data)).convert("RGB"), dtype=np.float32)
+                    grid[j * 256:(j + 1) * 256, i * 256:(i + 1) * 256] = a[:, :, 0] * 256 + a[:, :, 1] + a[:, :, 2] / 256 - 32768
+                    any_data = True
+        if not any_data:
+            return None
+        grid = grid[: bh * 256 + 2, : bw * 256 + 2]
+        # gentle 3x3 smoothing: z12 terrain is ~30 m per pixel; this removes the staircase look
+        pad = np.pad(grid, 1, mode="edge")
+        grid = sum(pad[dy:dy + grid.shape[0], dx:dx + grid.shape[1]] for dy in range(3) for dx in range(3)) / 9
+        # 20 m lines in hills; 50 m in high mountains (thousands of metres of relief would be a solid brown mass)
+        step = CONTOUR_STEP if np.nanmax(grid) < 2500 else 50
+        grid = np.nan_to_num(grid, nan=-32768).round().astype("<i2")
+        base = tmp / f"b{bx}_{by}"
+        grid.tofile(f"{base}.bil")
+        ulx = -MERC + bx * tile_m + px_m / 2
+        uly = MERC - by * tile_m - px_m / 2
+        Path(f"{base}.hdr").write_text(
+            f"NROWS {grid.shape[0]}\nNCOLS {grid.shape[1]}\nNBANDS 1\nNBITS 16\nPIXELTYPE SIGNEDINT\n"
+            f"BYTEORDER I\nLAYOUT BIL\nULXMAP {ulx!r}\nULYMAP {uly!r}\nXDIM {px_m!r}\nYDIM {px_m!r}\nNODATA -32768\n")
+        subprocess.run(["gdal_contour", "-q", "-a", "height", "-i", str(step), "-snodata", "-32768",
+                        "-f", "GPKG", f"{base}.bil", f"{base}.gpkg"], check=True)
+        out = Path(f"{base}.geojsonl")
+        subprocess.run(["ogr2ogr", "-f", "GeoJSONSeq", str(out), f"{base}.gpkg", "-s_srs", "EPSG:3857", "-t_srs", "EPSG:4326",
+                        "-dialect", "SQLite", "-sql", sql, "-lco", "COORDINATE_PRECISION=6"],
+                       check=True, stderr=subprocess.DEVNULL)
+        for ext in (".bil", ".hdr", ".gpkg"):
+            Path(f"{base}{ext}").unlink(missing_ok=True)
+        return out if out.exists() and out.stat().st_size > 0 else None
+
+    jobs = [(bx, by) for bx in range(xs[0], xs[-1] + 1, B) for by in range(ys[0], ys[-1] + 1, B)]
+    with cf.ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+        parts = [p for p in ex.map(lambda j: block(*j), jobs) if p]
+    if not parts:
+        log(f"Contours {region['id']}: no terrain data")
+        return None
+    out_pm = OUT / f"{region['id']}-contours.pmtiles"
+    out_pm.unlink(missing_ok=True)
+    # 100 m lines from zoom 10, 50 m from 12, all lines from 13 (keeps mountains readable when zoomed out)
+    zoom_filter = json.dumps({"contour": ["any", ["==", "nth_line", 10],
+                                          ["all", ["==", "nth_line", 5], [">=", "$zoom", 12]], [">=", "$zoom", 13]]})
+    subprocess.run(["tippecanoe", "-q", "-o", str(out_pm), "-l", "contour", "-Z10", "-z14", "--force",
+                    "--no-tile-size-limit", "--no-feature-limit", "--simplification=4", "-j", zoom_filter,
+                    "-P", *map(str, parts)], check=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    log(f"Contours {region['id']}: {out_pm.stat().st_size / 1e6:.0f} MB")
+    return out_pm
+
+
 # ---------------------------------------------------------------- index + upload
 
 def write_index(regions, base_url=""):
@@ -249,12 +342,14 @@ def write_index(regions, base_url=""):
     for r in regions:
         m = OUT / f"{r['id']}.pmtiles"
         d = OUT / f"{r['id']}-dem.pmtiles"
+        c = OUT / f"{r['id']}-contours.pmtiles"
         if not m.exists():
             continue
         packs.append({
             "id": r["id"], "name": r["name"], "group": r.get("group", ""), "bbox": r["bbox"],
             "map": {"file": base_url + m.name, "bytes": m.stat().st_size},
             "dem": {"file": base_url + d.name, "bytes": d.stat().st_size} if d.exists() else None,
+            "contours": {"file": base_url + c.name, "bytes": c.stat().st_size} if c.exists() else None,
             "built": dt.datetime.fromtimestamp(m.stat().st_mtime).strftime("%Y-%m-%d"),
         })
     idx = {"version": 1, "attribution": "© OpenStreetMap contributors · Elevation: Mapzen/AWS", "packs": packs}
@@ -283,6 +378,7 @@ def main():
     ap.add_argument("--only", help="build only this region id")
     ap.add_argument("--ram", type=int, default=6, help="GB of memory for Planetiler (default 6; use 4 on an 8 GB PC)")
     ap.add_argument("--skip-map", action="store_true", help="only (re)build the terrain packs")
+    ap.add_argument("--no-contours", action="store_true", help="don't make contour lines")
     ap.add_argument("--rebuild", action="store_true", help="build the country map again with fresh OpenStreetMap data")
     ap.add_argument("--cleanup", action="store_true", help="delete the OSM downloads after the country map is built (saves ~4 GB)")
     ap.add_argument("--base-url", default="", help="for 'index': prefix for file links, e.g. a GitHub release download URL ending in /")
@@ -315,6 +411,8 @@ def main():
         if country is not None:
             extract(country, OUT / f"{r['id']}.pmtiles", r["bbox"])
         build_dem(r)
+        if not a.no_contours:
+            build_contours(r)
         sizes = ", ".join(f"{p.name} {p.stat().st_size / 1e6:.0f} MB" for p in sorted(OUT.glob(f"{r['id']}*.pmtiles")))
         log(f"OK [{i}/{len(regions)}] {r['name']}: {sizes}  ({time.time() - t0:.0f} s)")
     write_index(cfg["regions"])
