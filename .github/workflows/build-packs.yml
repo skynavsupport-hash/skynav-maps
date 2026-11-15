@@ -18,13 +18,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v5
 
-      - name: Free disk space (OpenStreetMap data + temp files need ~10 GB)
+      - name: Free disk space (all-India map + 38 packs need ~30 GB)
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force || true
           df -h /
 
       - uses: actions/setup-java@v5
@@ -37,13 +39,16 @@ jobs:
           python-version: "3.12"
 
       - name: Build packs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # to fetch the pmtiles tool without hitting rate limits
         run: |
           pip install pmtiles
           if [ -n "${{ github.event.inputs.only }}" ]; then
-            python build_packs.py --ram 10 --only "${{ github.event.inputs.only }}"
+            python build_packs.py --ram 12 --cleanup --only "${{ github.event.inputs.only }}"
           else
-            python build_packs.py --ram 10
+            python build_packs.py --ram 12 --cleanup
           fi
+          df -h /
           ls -la out
 
       - name: Publish release
