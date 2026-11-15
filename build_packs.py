@@ -5,6 +5,7 @@ whole flying area in one go (seconds instead of many minutes of single tiles).
 
     python build_packs.py                 build every region in regions.json
     python build_packs.py --only bir-billing
+    python build_packs.py --rebuild      fresh OpenStreetMap data (otherwise work/india.pmtiles is reused)
     python build_packs.py upload-r2       upload the packs to Cloudflare R2 (bucket skynav-maps)
     python build_packs.py index --base-url https://github.com/<you>/<repo>/releases/download/maps-v1/
 
@@ -112,12 +113,15 @@ def download(url, dest: Path, tries=20):
             time.sleep(min(60, attempt * 5))
 
 
-def build_map(java, region, area, ram_gb):
-    """OpenMapTiles-schema vector tiles z0-14 for the region (the same schema the app's map style uses)."""
-    OUT.mkdir(exist_ok=True)
+def build_country_map(java, area, bbox, ram_gb, rebuild=False):
+    """OpenMapTiles-schema vector tiles z0-14 for the whole country, built once with Planetiler.
+    Every pack is then cut out of this file in seconds (pmtiles extract)."""
     WORK.mkdir(exist_ok=True)
-    w, s, e, n = region["bbox"]
-    out = OUT / f"{region['id']}.pmtiles"
+    out = WORK / f"{area}.pmtiles"
+    if out.exists() and not rebuild:
+        log(f"Using the existing {out.name} (add --rebuild to make it again with fresh map data)")
+        return out
+    w, s, e, n = bbox
     cmd = [
         java, f"-Xmx{ram_gb}g", "-jar", str(planetiler_jar()),
         "--download", f"--area={area}",
@@ -127,9 +131,53 @@ def build_map(java, region, area, ram_gb):
         "--maxzoom=14",
         "--http_retries=20", "--http_timeout=120s",
     ]
-    log(f"Map {region['id']}: running Planetiler (first run downloads OpenStreetMap data for '{area}', a few GB)...")
+    log(f"Map: running Planetiler for '{area}' (downloads OpenStreetMap data, a few GB, the first time)...")
     subprocess.run(cmd, check=True, cwd=WORK)
     return out
+
+
+def pmtiles_cli():
+    """The 'pmtiles' command-line tool (protomaps/go-pmtiles), downloaded once."""
+    TOOLS.mkdir(exist_ok=True)
+    exe = TOOLS / ("pmtiles.exe" if platform.system() == "Windows" else "pmtiles")
+    if exe.exists():
+        return exe
+    system = {"Windows": "windows", "Darwin": "darwin"}.get(platform.system(), "linux")
+    machine = platform.machine().lower()
+    arch = "arm64" if machine in ("arm64", "aarch64") else "x86_64"
+    headers = {"User-Agent": "SkyNav pack builder", "Accept": "application/vnd.github+json"}
+    if os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"):
+        headers["Authorization"] = "Bearer " + (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"))
+    req = urllib.request.Request("https://api.github.com/repos/protomaps/go-pmtiles/releases/latest", headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        rel = json.load(r)
+    asset = next((a for a in rel["assets"]
+                  if system in a["name"].lower() and arch in a["name"].lower()
+                  and a["name"].lower().endswith((".zip", ".tar.gz"))), None)
+    if not asset:
+        sys.exit("Couldn't find the pmtiles tool for this computer on github.com/protomaps/go-pmtiles/releases")
+    arc = TOOLS / asset["name"]
+    log(f"Downloading the pmtiles tool ({asset['name']})...")
+    download(asset["browser_download_url"], arc)
+    import tarfile, zipfile
+    if arc.name.endswith(".zip"):
+        with zipfile.ZipFile(arc) as z:
+            name = next(n for n in z.namelist() if n.split("/")[-1] in ("pmtiles", "pmtiles.exe"))
+            exe.write_bytes(z.read(name))
+    else:
+        with tarfile.open(arc) as t:
+            m = next(m for m in t.getmembers() if m.name.split("/")[-1] == "pmtiles")
+            exe.write_bytes(t.extractfile(m).read())
+    exe.chmod(0o755)
+    arc.unlink()
+    return exe
+
+
+def extract(src: Path, dst: Path, bbox):
+    w, s, e, n = bbox
+    OUT.mkdir(exist_ok=True)
+    subprocess.run([str(pmtiles_cli()), "extract", str(src), str(dst), f"--bbox={w},{s},{e},{n}"],
+                   check=True, stdout=subprocess.DEVNULL)
 
 
 # ---------------------------------------------------------------- terrain (DEM) pack
@@ -166,31 +214,26 @@ def build_dem(region):
     tiles = [t for z in range(DEM_MIN_ZOOM, DEM_MAX_ZOOM + 1) for t in tiles_in_bbox(region["bbox"], z)]
     log(f"Terrain {region['id']}: {len(tiles)} elevation tiles...")
     cache = WORK / "dem"
-    got = {}
-    todo = []
-    for (z, x, y) in tiles:
-        f = cache / str(z) / str(x) / f"{y}.png"
-        if f.exists():
-            got[(z, x, y)] = f.read_bytes()
-        else:
-            todo.append((z, x, y))
+    def path(z, x, y):
+        return cache / str(z) / str(x) / f"{y}.png"
+    todo = [t for t in tiles if not path(*t).exists()]
     done = 0
     with cf.ThreadPoolExecutor(32) as ex:
         for z, x, y, data in ex.map(lambda t: fetch(*t), todo):
-            f = cache / str(z) / str(x) / f"{y}.png"
+            f = path(z, x, y)
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_bytes(data)
-            got[(z, x, y)] = data
             done += 1
-            if done % 200 == 0:
+            if done % 1000 == 0:
                 log(f"  {done}/{len(todo)} downloaded")
 
+    OUT.mkdir(exist_ok=True)
     out = OUT / f"{region['id']}-dem.pmtiles"
     w, s, e, n = region["bbox"]
     with open(out, "wb") as f:
         wr = Writer(f)
-        for tid, data in sorted((zxy_to_tileid(*k), v) for k, v in got.items()):
-            wr.write_tile(tid, data)
+        for tid, k in sorted((zxy_to_tileid(*k), k) for k in tiles):   # tiles are read one at a time: big states fit in memory
+            wr.write_tile(tid, path(*k).read_bytes())
         wr.finalize({
             "tile_type": TileType.PNG, "tile_compression": Compression.NONE,
             "min_lon_e7": int(w * 1e7), "min_lat_e7": int(s * 1e7), "max_lon_e7": int(e * 1e7), "max_lat_e7": int(n * 1e7),
@@ -209,7 +252,7 @@ def write_index(regions, base_url=""):
         if not m.exists():
             continue
         packs.append({
-            "id": r["id"], "name": r["name"], "bbox": r["bbox"],
+            "id": r["id"], "name": r["name"], "group": r.get("group", ""), "bbox": r["bbox"],
             "map": {"file": base_url + m.name, "bytes": m.stat().st_size},
             "dem": {"file": base_url + d.name, "bytes": d.stat().st_size} if d.exists() else None,
             "built": dt.datetime.fromtimestamp(m.stat().st_mtime).strftime("%Y-%m-%d"),
@@ -240,6 +283,8 @@ def main():
     ap.add_argument("--only", help="build only this region id")
     ap.add_argument("--ram", type=int, default=6, help="GB of memory for Planetiler (default 6; use 4 on an 8 GB PC)")
     ap.add_argument("--skip-map", action="store_true", help="only (re)build the terrain packs")
+    ap.add_argument("--rebuild", action="store_true", help="build the country map again with fresh OpenStreetMap data")
+    ap.add_argument("--cleanup", action="store_true", help="delete the OSM downloads after the country map is built (saves ~4 GB)")
     ap.add_argument("--base-url", default="", help="for 'index': prefix for file links, e.g. a GitHub release download URL ending in /")
     a = ap.parse_args()
 
@@ -257,14 +302,21 @@ def main():
         import pmtiles  # noqa: F401
     except ImportError:
         sys.exit("Please run:  pip install pmtiles")
-    java = None if a.skip_map else find_java()
-    for r in regions:
+
+    country = None
+    if not a.skip_map:
+        country = build_country_map(find_java(), cfg.get("osm_area", "india"), cfg.get("india_bbox", [68.0, 6.5, 97.5, 37.2]),
+                                    a.ram, a.rebuild)
+        if a.cleanup:
+            shutil.rmtree(WORK / "sources", ignore_errors=True)  # OSM downloads are not needed any more
+            shutil.rmtree(WORK / "tmp", ignore_errors=True)
+    for i, r in enumerate(regions, 1):
         t0 = time.time()
-        if not a.skip_map:
-            build_map(java, r, cfg.get("osm_area", "india"), a.ram)
+        if country is not None:
+            extract(country, OUT / f"{r['id']}.pmtiles", r["bbox"])
         build_dem(r)
-        sizes = ", ".join(f"{p.name} {p.stat().st_size / 1e6:.0f} MB" for p in OUT.glob(f"{r['id']}*.pmtiles"))
-        log(f"OK {r['name']}: {sizes}  ({(time.time() - t0) / 60:.0f} min)")
+        sizes = ", ".join(f"{p.name} {p.stat().st_size / 1e6:.0f} MB" for p in sorted(OUT.glob(f"{r['id']}*.pmtiles")))
+        log(f"OK [{i}/{len(regions)}] {r['name']}: {sizes}  ({time.time() - t0:.0f} s)")
     write_index(cfg["regions"])
 
 
