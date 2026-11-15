@@ -38,11 +38,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install contour-line tools (GDAL, tippecanoe)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gdal-bin tippecanoe
+
       - name: Build packs
         env:
           GITHUB_TOKEN: ${{ github.token }}   # to fetch the pmtiles tool without hitting rate limits
         run: |
-          pip install pmtiles
+          pip install pmtiles pillow numpy
           if [ -n "${{ github.event.inputs.only }}" ]; then
             python build_packs.py --ram 12 --cleanup --only "${{ github.event.inputs.only }}"
           else
