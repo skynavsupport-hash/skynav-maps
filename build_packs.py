@@ -244,12 +244,15 @@ def build_dem(region):
 
 # ---------------------------------------------------------------- contour lines
 
-CONTOUR_STEP = 20      # metres between lines; every 100 m is an index line (thicker, labelled)
+CONTOUR_STEP = 10      # metres between lines in hills (Sahyadri: 500-1400 m); every 100 m is an index line
+CONTOUR_STEP_HIGH = 20 # blocks whose terrain reaches 1500 m
+CONTOUR_STEP_ALPINE = 50  # blocks reaching 2500 m (Himalaya): thousands of metres of relief
 MERC = 20037508.342789244
 
 
 def build_contours(region):
-    """Contour lines from the region's terrain pack (z12, ~30 m), as vector tiles z10-14 in a
+    """Contour lines (10 m in hills, 20 m above 1500 m, 50 m above 2500 m) from the region's terrain
+    pack (z12, ~30 m), as vector tiles z10-14 in a
     'contour' layer with 'height' and 'nth_line' - the same fields as MapTiler's contours, so the
     app's map style draws them the same way, offline. Needs gdal_contour, ogr2ogr and tippecanoe
     (the GitHub Action installs them; on a PC this step is skipped if they're missing)."""
@@ -272,7 +275,8 @@ def build_contours(region):
     px_m = tile_m / 256
     B = 8   # tiles per block side (2048 x 2048 pixels)
     sql = ("SELECT geom, CAST(height AS INTEGER) AS height, "
-           "CASE WHEN CAST(height AS INTEGER) % 100 = 0 THEN 10 WHEN CAST(height AS INTEGER) % 50 = 0 THEN 5 ELSE 1 END AS nth_line "
+           "CASE WHEN CAST(height AS INTEGER) % 100 = 0 THEN 10 WHEN CAST(height AS INTEGER) % 50 = 0 THEN 5 "
+           "WHEN CAST(height AS INTEGER) % 20 = 0 THEN 2 ELSE 1 END AS nth_line "
            "FROM contour WHERE height > 0")
 
     def block(bx, by):
@@ -296,8 +300,10 @@ def build_contours(region):
         # gentle 3x3 smoothing: z12 terrain is ~30 m per pixel; this removes the staircase look
         pad = np.pad(grid, 1, mode="edge")
         grid = sum(pad[dy:dy + grid.shape[0], dx:dx + grid.shape[1]] for dy in range(3) for dx in range(3)) / 9
-        # 20 m lines in hills; 50 m in high mountains (thousands of metres of relief would be a solid brown mass)
-        step = CONTOUR_STEP if np.nanmax(grid) < 2500 else 50
+        # 10 m lines in hills, 20 m in high hills, 50 m in big mountains (thousands of metres of relief
+        # would be a solid brown mass). Decided per 2048-px block (~80 km), so a valley stays consistent.
+        top = np.nanmax(grid)
+        step = CONTOUR_STEP if top < 1500 else CONTOUR_STEP_HIGH if top < 2500 else CONTOUR_STEP_ALPINE
         grid = np.nan_to_num(grid, nan=-32768).round().astype("<i2")
         base = tmp / f"b{bx}_{by}"
         grid.tofile(f"{base}.bil")
@@ -324,9 +330,12 @@ def build_contours(region):
         return None
     out_pm = OUT / f"{region['id']}-contours.pmtiles"
     out_pm.unlink(missing_ok=True)
-    # 100 m lines from zoom 10, 50 m from 12, all lines from 13 (keeps mountains readable when zoomed out)
+    # 100 m lines from zoom 10, 50 m from 12, 20 m from 13, 10 m from 14 (the map over-zooms z14 tiles
+    # beyond that) - keeps hills readable when zoomed out, detailed like MapTiler's when zoomed in
     zoom_filter = json.dumps({"contour": ["any", ["==", "nth_line", 10],
-                                          ["all", ["==", "nth_line", 5], [">=", "$zoom", 12]], [">=", "$zoom", 13]]})
+                                          ["all", ["==", "nth_line", 5], [">=", "$zoom", 12]],
+                                          ["all", ["==", "nth_line", 2], [">=", "$zoom", 13]],
+                                          [">=", "$zoom", 14]]})
     subprocess.run(["tippecanoe", "-q", "-o", str(out_pm), "-l", "contour", "-Z10", "-z14", "--force",
                     "--no-tile-size-limit", "--no-feature-limit", "--simplification=4", "-j", zoom_filter,
                     "-P", *map(str, parts)], check=True)
@@ -345,11 +354,14 @@ def write_index(regions, base_url=""):
         c = OUT / f"{r['id']}-contours.pmtiles"
         if not m.exists():
             continue
+        # "?v=<build time>" makes every build a new address, so the Cloudflare relay's 24 h cache can
+        # never hand out an old file (or mix old and new parts in a resumed download) after a rebuild
+        v = "?v=" + dt.datetime.fromtimestamp(m.stat().st_mtime).strftime("%Y%m%d%H%M")
         packs.append({
             "id": r["id"], "name": r["name"], "group": r.get("group", ""), "bbox": r["bbox"],
-            "map": {"file": base_url + m.name, "bytes": m.stat().st_size},
-            "dem": {"file": base_url + d.name, "bytes": d.stat().st_size} if d.exists() else None,
-            "contours": {"file": base_url + c.name, "bytes": c.stat().st_size} if c.exists() else None,
+            "map": {"file": base_url + m.name + v, "bytes": m.stat().st_size},
+            "dem": {"file": base_url + d.name + v, "bytes": d.stat().st_size} if d.exists() else None,
+            "contours": {"file": base_url + c.name + v, "bytes": c.stat().st_size} if c.exists() else None,
             "built": dt.datetime.fromtimestamp(m.stat().st_mtime).strftime("%Y-%m-%d"),
         })
     idx = {"version": 1, "attribution": "© OpenStreetMap contributors · Elevation: Mapzen/AWS", "packs": packs}
